@@ -91,11 +91,9 @@ def build_apk(project_files, work_dir):
     <uses-sdk android:minSdkVersion="{min_sdk}" android:targetSdkVersion="34" />
     <application
         android:label="{app_name}"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
-        android:allowBackup="false">
+        android:theme="@android:style/Theme.NoTitleBar">
         <activity android:name=".{main_activity}"
-            android:exported="true"
-            android:configChanges="orientation|screenSize">
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -253,8 +251,9 @@ def build_apk(project_files, work_dir):
         log("[7/9] Сборка APK...")
         unsigned_apk = os.path.join(work_dir, f"{app_name}_unsigned.apk")
         dex_path = os.path.join(work_dir, "classes.dex")
+        res_dir = os.path.join(work_dir, "res")
 
-        # Создаём APK: копируем всё из resources.ap_ + classes.dex
+        # Создаём APK: копируем всё из resources.ap_ + classes.dex + res/
         # resources.ap_ от aapt2 link — это ZIP-архив с манифестом и ресурсами
         if os.path.exists(resources_ap_):
             try:
@@ -262,19 +261,42 @@ def build_apk(project_files, work_dir):
                     with zipfile.ZipFile(resources_ap_, "r") as res_zf:
                         for item in res_zf.infolist():
                             out_zf.writestr(item, res_zf.read(item.filename))
+
+                    # Добавляем classes.dex
                     if os.path.exists(dex_path):
                         with open(dex_path, "rb") as dex_f:
                             out_zf.writestr("classes.dex", dex_f.read())
-                        log(f"[7/9] ✓ APK собран (classes.dex = {os.path.getsize(dex_path)} bytes)")
+                        log(f"[7/9] ✓ classes.dex добавлен ({os.path.getsize(dex_path)} bytes)")
                     else:
                         log("[7/9] ⚠ classes.dex не найден")
+
+                    # Добавляем папку res/ с файлами
+                    if os.path.isdir(res_dir):
+                        res_count = 0
+                        for root, dirs, files in os.walk(res_dir):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.relpath(file_path, work_dir)
+                                out_zf.write(file_path, arcname)
+                                res_count += 1
+                        log(f"[7/9] ✓ res/ добавлен ({res_count} файлов)")
+                    else:
+                        log("[7/9] ⚠ res/ не найден")
+
+                    log("[7/9] ✓ APK собран")
             except zipfile.BadZipFile:
-                # resources.ap_ не ZIP — копируем как бинарный и добавляем dex
+                # resources.ap_ не ZIP — копируем как бинарный и добавляем dex + res
                 log("[7/9] ⚠ resources.ap_ не ZIP, собираем вручную...")
                 shutil.copy(resources_ap_, unsigned_apk)
-                if os.path.exists(dex_path):
-                    with zipfile.ZipFile(unsigned_apk, "a", zipfile.ZIP_DEFLATED) as zf:
+                with zipfile.ZipFile(unsigned_apk, "a", zipfile.ZIP_DEFLATED) as zf:
+                    if os.path.exists(dex_path):
                         zf.write(dex_path, "classes.dex")
+                    if os.path.isdir(res_dir):
+                        for root, dirs, files in os.walk(res_dir):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.relpath(file_path, work_dir)
+                                zf.write(file_path, arcname)
         else:
             log("[7/9] ✗ resources.ap_ не найден")
             return {"success": False, "error": "resources.ap_ missing", "logs": logs}
