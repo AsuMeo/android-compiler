@@ -280,8 +280,21 @@ def build_apk(project_files, work_dir):
         apk_size = os.path.getsize(unsigned_apk)
         log(f"[7/9] 📦 Unsigned APK: {apk_size} bytes")
 
-        # === [8/9] Подпись ===
-        log("[8/9] Подпись APK...")
+        # === [8/9] zipalign (ДО подписи!) ===
+        log("[8/9] Выравнивание (zipalign)...")
+        zipalign = os.path.join(BUILD_TOOLS, "zipalign")
+        aligned_apk = os.path.join(work_dir, f"{app_name}_aligned.apk")
+        r = subprocess.run([zipalign, "-f", "4", unsigned_apk, aligned_apk], capture_output=True, text=True)
+
+        if r.returncode == 0 and os.path.exists(aligned_apk) and os.path.getsize(aligned_apk) > 100:
+            apk_to_sign = aligned_apk
+            log(f"[8/9] ✓ APK выровнен ({os.path.getsize(aligned_apk)} bytes)")
+        else:
+            apk_to_sign = unsigned_apk
+            log("[8/9] ⚠ zipalign пропущен, использую unsigned")
+
+        # === [9/9] Подпись (ПОСЛЕ zipalign!) ===
+        log("[9/9] Подпись APK...")
         keystore = os.path.join(work_dir, "debug.keystore")
         keytool = os.path.join(os.environ.get("JAVA_HOME", "/usr/lib/jvm/java-17-openjdk-amd64"), "bin", "keytool")
         subprocess.run([keytool, "-genkey", "-v", "-keystore", keystore, "-alias", "androiddebugkey",
@@ -291,31 +304,19 @@ def build_apk(project_files, work_dir):
         apksigner = os.path.join(BUILD_TOOLS, "apksigner")
         signed_apk = os.path.join(work_dir, f"{app_name}.apk")
         r = subprocess.run([apksigner, "sign", "--ks", keystore, "--ks-pass", "pass:android",
-            "--key-pass", "pass:android", "--out", signed_apk, unsigned_apk], capture_output=True, text=True)
+            "--key-pass", "pass:android", "--out", signed_apk, apk_to_sign], capture_output=True, text=True)
 
         if r.returncode != 0:
-            log(f"[8/9] ⚠ apksigner не сработал, пробую jarsigner...")
+            log(f"[9/9] ⚠ apksigner не сработал, пробую jarsigner...")
             jarsigner = os.path.join(os.environ.get("JAVA_HOME", "/usr/lib/jvm/java-17-openjdk-amd64"), "bin", "jarsigner")
             subprocess.run([jarsigner, "-verbose", "-sigalg", "SHA1withRSA", "-digestalg", "SHA1",
-                "-keystore", keystore, "-storepass", "android", unsigned_apk, "androiddebugkey"], capture_output=True)
-            shutil.copy(unsigned_apk, signed_apk)
+                "-keystore", keystore, "-storepass", "android", apk_to_sign, "androiddebugkey"], capture_output=True)
+            shutil.copy(apk_to_sign, signed_apk)
 
         signed_size = os.path.getsize(signed_apk)
-        log(f"[8/9] ✓ APK подписан ({signed_size} bytes)")
+        log(f"[9/9] ✓ APK подписан ({signed_size} bytes)")
 
-        # === [9/9] zipalign ===
-        log("[9/9] Выравнивание (zipalign)...")
-        zipalign = os.path.join(BUILD_TOOLS, "zipalign")
-        aligned_apk = os.path.join(work_dir, f"{app_name}_aligned.apk")
-        r = subprocess.run([zipalign, "-f", "4", signed_apk, aligned_apk], capture_output=True, text=True)
-
-        if r.returncode == 0 and os.path.exists(aligned_apk) and os.path.getsize(aligned_apk) > 100:
-            final_apk = aligned_apk
-            log(f"[9/9] ✓ APK выровнен ({os.path.getsize(aligned_apk)} bytes)")
-        else:
-            final_apk = signed_apk
-            log("[9/9] ⚠ zipalign пропущен")
-
+        final_apk = signed_apk
         final_size = os.path.getsize(final_apk)
         log(f"🎉 APK готов: {final_size} bytes")
         return {"success": True, "apk_path": final_apk, "logs": logs}
