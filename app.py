@@ -211,12 +211,18 @@ HTML_PAGE = r"""
 """
 
 
+def run_cmd(cmd_list, label="cmd"):
+    """Run command list and log errors."""
+    result = subprocess.run(cmd_list, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[{label}] FAILED")
+        print(f"[{label}] STDERR: {result.stderr[:800]}")
+        print(f"[{label}] STDOUT: {result.stdout[:800]}")
+    return result.returncode == 0
+
+
 def create_tg_overlay(width=800, height=800, duration=0.8, fps=30, out_path="/tmp/tg_overlay.mp4"):
-    """
-    Generate animated Telegram video_note intro using Pillow + FFmpeg.
-    Matches the screenshot: dark background, white paper-plane logo bottom-left,
-    'TELEGRAM' text bottom-right rotated, gentle fade-in animation.
-    """
+    """Generate Telegram video_note intro with logo + TELEGRAM text."""
     frames = int(duration * fps)
     frame_dir = "/tmp/tg_frames"
     os.makedirs(frame_dir, exist_ok=True)
@@ -228,7 +234,7 @@ def create_tg_overlay(width=800, height=800, duration=0.8, fps=30, out_path="/tm
         has_pil = False
 
     if has_pil:
-        # Paper plane polygon points (normalized 0-1)
+        # Paper plane polygon (normalized)
         plane_pts = [
             (0.18, 0.35), (0.50, 0.48), (0.82, 0.50),
             (0.50, 0.58), (0.35, 0.82), (0.42, 0.62), (0.18, 0.35)
@@ -236,12 +242,10 @@ def create_tg_overlay(width=800, height=800, duration=0.8, fps=30, out_path="/tm
 
         for i in range(frames):
             t = i / max(frames - 1, 1)
-
-            # Dark purple-black background
             bg = Image.new('RGB', (width, height), '#120812')
             draw = ImageDraw.Draw(bg)
 
-            # Subtle radial vignette
+            # Vignette
             cx, cy = width // 2, height // 2
             max_r = int((width**2 + height**2) ** 0.5 / 2)
             for r in range(max_r, 0, -8):
@@ -250,24 +254,17 @@ def create_tg_overlay(width=800, height=800, duration=0.8, fps=30, out_path="/tm
                 draw.ellipse([cx - r, cy - r, cx + r, cy + r],
                              outline=f'#{v:02x}{v//4:02x}{v//4:02x}')
 
-            # Fade-in factor
             fade = min(1.0, t * 2.5)
-
-            # Paper plane logo (bottom-left)
             logo_size = 52
             base_lx, base_ly = 32, height - 32 - logo_size
-
-            # Gentle scale pulse during fade
             pulse = 1.0 + 0.06 * (1.0 - abs(t - 0.5) * 2) * fade
             s = logo_size * pulse
             lx = base_lx - (s - logo_size) / 2
             ly = base_ly - (s - logo_size) / 2
 
             pts = [(lx + p[0]*s, ly + p[1]*s) for p in plane_pts]
-            white = (255, 255, 255)
-            draw.polygon(pts, fill=white)
+            draw.polygon(pts, fill=(255, 255, 255))
 
-            # TELEGRAM text (bottom-right, rotated ~-15deg)
             try:
                 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 19)
             except:
@@ -277,121 +274,106 @@ def create_tg_overlay(width=800, height=800, duration=0.8, fps=30, out_path="/tm
                     font = ImageFont.load_default()
 
             text = "TELEGRAM"
-            # Position bottom-right
             bbox = draw.textbbox((0, 0), text, font=font)
             tw = bbox[2] - bbox[0]
             tx = width - tw - 35
             ty = height - 35
 
-            # Draw with slight transparency
             for j, ch in enumerate(text):
                 char_x = tx + j * 11
                 draw.text((char_x, ty), ch, fill=(255, 255, 255), font=font)
 
             bg.save(f"{frame_dir}/frame_{i:04d}.png")
 
-        # Encode frames to MP4
-        cmd = (
-            f'ffmpeg -y -framerate {fps} -i "{frame_dir}/frame_%04d.png" '
-            f'-c:v libx264 -preset fast -crf 18 -an -pix_fmt yuv420p '
-            f'-t {duration} "{out_path}"'
-        )
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        cmd = [
+            "ffmpeg", "-y", "-framerate", str(fps),
+            "-i", f"{frame_dir}/frame_%04d.png",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-an", "-pix_fmt", "yuv420p", "-t", str(duration), out_path
+        ]
+        ok = run_cmd(cmd, "overlay_encode")
 
-        # Cleanup frames
         for f in os.listdir(frame_dir):
             os.unlink(os.path.join(frame_dir, f))
         os.rmdir(frame_dir)
 
-        return r.returncode == 0, out_path
+        return ok, out_path
 
     else:
-        # Fallback: pure ffmpeg
-        cmd = (
-            f'ffmpeg -y -f lavfi -i color=c=#120812:s={width}x{height}:r={fps} '
-            f'-vf "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:'
-            f'text=\'TELEGRAM\':x=w-tw-35:y=h-th-30:fontcolor=white@0.35:fontsize=18:'
-            f'enable=\'between(t\\,0\\,{duration})\','
-            f'drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:'
-            f'text=\'\\u27A4\':x=35:y=h-70:fontcolor=white@0.85:fontsize=45:'
-            f'enable=\'between(t\\,0\\,{duration})\'" '
-            f'-c:v libx264 -preset fast -crf 18 -an -pix_fmt yuv420p '
-            f'-t {duration} "{out_path}"'
-        )
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        return r.returncode == 0, out_path
+        # Fallback ffmpeg drawtext
+        cmd = [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", f"color=c=#120812:s={width}x{height}:r={fps}",
+            "-vf",
+            f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='TELEGRAM':x=w-tw-35:y=h-th-30:fontcolor=white@0.35:fontsize=18:enable='between(t,0,{duration})',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='\\u27A4':x=35:y=h-70:fontcolor=white@0.85:fontsize=45:enable='between(t,0,{duration})'",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-an", "-pix_fmt", "yuv420p", "-t", str(duration), out_path
+        ]
+        ok = run_cmd(cmd, "overlay_fallback")
+        return ok, out_path
 
 
 def process_video_with_overlay(input_path: str, output_path: str) -> bool:
-    """
-    Pipeline:
-    1. Generate Telegram overlay intro (0.8s)
-    2. Crop input to square 800x800
-    3. Concatenate: overlay + main video
-    4. Apply circular mask with black border
-    5. Output as MP4 ready for video_note
-    """
+    """Full pipeline: overlay intro + square crop + concat + circular mask."""
 
-    # Step 1: Create overlay animation
+    # Step 1: Overlay intro
     overlay_ok, overlay_path = create_tg_overlay()
     if not overlay_ok:
         return False
 
-    # Step 2: Prepare main video (square crop, 800x800, no audio)
+    # Step 2: Square crop main video
     main_sq = "/tmp/main_square.mp4"
-    cmd_sq = (
-        f'ffmpeg -y -i "{input_path}" -vf '
-        f'"crop=min(iw\\,ih):min(iw\\,ih),'
-        f'scale=800:800:force_original_aspect_ratio=increase,'
-        f'crop=800:800,setsar=1,format=yuv420p" '
-        f'-c:v libx264 -preset fast -crf 23 -an -movflags +faststart "{main_sq}"'
-    )
-    r1 = subprocess.run(cmd_sq, shell=True, capture_output=True, text=True)
-    if r1.returncode != 0:
+    cmd_sq = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", "crop=min(iw,ih):min(iw,ih),scale=800:800:force_original_aspect_ratio=increase,crop=800:800,setsar=1,format=yuv420p",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-an", "-movflags", "+faststart", main_sq
+    ]
+    if not run_cmd(cmd_sq, "square_crop"):
         return False
 
-    # Step 3: Concatenate overlay + main video
+    # Step 3: Concatenate
     concat_list = "/tmp/concat_list.txt"
     with open(concat_list, "w") as f:
         f.write(f"file '{overlay_path}'\n")
         f.write(f"file '{main_sq}'\n")
 
     concat_out = "/tmp/concatenated.mp4"
-    cmd_concat = f'ffmpeg -y -f concat -safe 0 -i "{concat_list}" -c copy "{concat_out}"'
-    r2 = subprocess.run(cmd_concat, shell=True, capture_output=True, text=True)
-    if r2.returncode != 0:
+    cmd_concat = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", concat_list, "-c", "copy", concat_out
+    ]
+    if not run_cmd(cmd_concat, "concat"):
         return False
 
-    # Step 4: Apply circular mask with smooth black border
+    # Step 4: Circular mask PNG
     mask_path = "/tmp/circle_mask_800.png"
-    cmd_mask = (
-        f'ffmpeg -y -f lavfi -i color=black:s=800x800 -vf '
-        f'"format=rgba,'
-        f'geq=lum=0:a=\'if(lt(hypot(X-400,Y-400),390),255,'
-        f'if(lt(hypot(X-400,Y-400),400),lerp(0,255,(400-hypot(X-400,Y-400))/10),0))\','
-        f'format=rgba" -frames:v 1 "{mask_path}"'
-    )
-    r3 = subprocess.run(cmd_mask, shell=True, capture_output=True, text=True)
-    if r3.returncode != 0:
+    cmd_mask = [
+        "ffmpeg", "-y", "-f", "lavfi",
+        "-i", "color=black:s=800x800",
+        "-vf", "format=rgba,geq=lum=0:a='if(lt(hypot(X-400,Y-400),390),255,if(lt(hypot(X-400,Y-400),400),lerp(0,255,(400-hypot(X-400,Y-400))/10),0))',format=rgba",
+        "-frames:v", "1", mask_path
+    ]
+    if not run_cmd(cmd_mask, "mask"):
         return False
 
-    # Apply mask to concatenated video
-    cmd_final = (
-        f'ffmpeg -y -i "{concat_out}" -i "{mask_path}" -filter_complex '
-        f'"[0:v][1:v]overlay=0:0:format=auto[masked];'
-        f'[masked]format=yuv420p" '
-        f'-c:v libx264 -preset fast -crf 23 -an -movflags +faststart "{output_path}"'
-    )
-    r4 = subprocess.run(cmd_final, shell=True, capture_output=True, text=True)
+    # Step 5: Apply mask
+    cmd_final = [
+        "ffmpeg", "-y", "-i", concat_out, "-i", mask_path,
+        "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto[masked];[masked]format=yuv420p",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-an", "-movflags", "+faststart", output_path
+    ]
+    ok = run_cmd(cmd_final, "final")
 
-    # Cleanup temp files
+    # Cleanup
     for f in [overlay_path, main_sq, concat_list, concat_out, mask_path]:
         try:
             os.unlink(f)
         except:
             pass
 
-    return r4.returncode == 0
+    return ok
 
 
 @app.route("/")
@@ -419,7 +401,7 @@ def send():
     try:
         ok = process_video_with_overlay(tmp_in_path, tmp_out_path)
         if not ok:
-            return jsonify({"ok": False, "message": "Ошибка обработки видео (FFmpeg)"}), 500
+            return jsonify({"ok": False, "message": "Ошибка обработки видео (FFmpeg). Проверьте логи сервера."}), 500
 
         bot = TeleBot(token)
         with open(tmp_out_path, "rb") as f:
