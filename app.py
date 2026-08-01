@@ -247,20 +247,24 @@ def build_apk(project_files, work_dir):
 
         log("[7/9] Сборка APK...")
         unsigned_apk = os.path.join(work_dir, f"{app_name}_unsigned.apk")
-
-        # Копируем resources.ap_ → unsigned_apk и добавляем classes.dex
-        # resources.ap_ уже является ZIP/APK с манифестом и ресурсами
-        shutil.copy(resources_ap_, unsigned_apk)
-
         dex_path = os.path.join(work_dir, "classes.dex")
-        if os.path.exists(dex_path):
-            with zipfile.ZipFile(unsigned_apk, "a", zipfile.ZIP_DEFLATED) as zf:
-                zf.write(dex_path, "classes.dex")
-            log(f"[7/9] ✓ APK собран, classes.dex добавлен ({os.path.getsize(dex_path)} bytes)")
-        else:
-            log("[7/9] ⚠ classes.dex не найден, APK без кода")
 
-        # Проверяем размер APK
+        # Пересобираем APK вручную: копируем всё из resources.ap_ + добавляем classes.dex
+        # resources.ap_ от aapt2 link — это ZIP, но zipfile.ZipFile("a") может ломать его
+        # Поэтому перепаковываем полностью
+        with zipfile.ZipFile(unsigned_apk, "w", zipfile.ZIP_DEFLATED) as out_zf:
+            # Копируем всё из resources.ap_
+            with zipfile.ZipFile(resources_ap_, "r") as res_zf:
+                for item in res_zf.infolist():
+                    out_zf.writestr(item, res_zf.read(item.filename))
+            # Добавляем classes.dex
+            if os.path.exists(dex_path):
+                with open(dex_path, "rb") as dex_f:
+                    out_zf.writestr("classes.dex", dex_f.read())
+                log(f"[7/9] ✓ APK собран, classes.dex добавлен ({os.path.getsize(dex_path)} bytes)")
+            else:
+                log("[7/9] ⚠ classes.dex не найден, APK без кода")
+
         apk_size = os.path.getsize(unsigned_apk)
         log(f"[7/9] 📦 Размер unsigned APK: {apk_size} bytes")
 
