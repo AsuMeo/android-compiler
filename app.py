@@ -149,14 +149,15 @@ def build_apk(project_files, work_dir):
         compiled_files = []
         for res_file in res_files_list:
             if res_file.endswith(".xml"):
-                r = subprocess.run([aapt2, "compile", "--legacy", "-o", compiled_res_dir, res_file],
+                # БЕЗ --legacy — создаёт правильные .flat файлы
+                r = subprocess.run([aapt2, "compile", "-o", compiled_res_dir, res_file],
                     capture_output=True, text=True)
                 if r.returncode != 0:
                     log(f"[3/9] ⚠ {os.path.basename(res_file)}: {r.stderr[:200]}")
                 else:
                     log(f"[3/9] ✓ {os.path.basename(res_file)}")
 
-        # Собираем ВСЕ .flat файлы из директории — aapt2 даёт им хешированные имена
+        # Собираем ВСЕ .flat файлы из директории
         for f in os.listdir(compiled_res_dir):
             if f.endswith(".flat"):
                 compiled_files.append(os.path.join(compiled_res_dir, f))
@@ -167,7 +168,8 @@ def build_apk(project_files, work_dir):
 
         log(f"[3/9] ✓ Скомпилировано ресурсов: {len(compiled_files)}")
         for cf in compiled_files:
-            log(f"      → {os.path.basename(cf)}")
+            sz = os.path.getsize(cf)
+            log(f"      → {os.path.basename(cf)} ({sz} bytes)")
 
         log("[4/9] Линковка ресурсов (aapt2 link)...")
         r_java_dir = os.path.join(work_dir, "r_java")
@@ -183,7 +185,8 @@ def build_apk(project_files, work_dir):
             "--target-sdk-version", "34",
             "--version-code", "1",
             "--version-name", "1.0",
-            "--auto-add-overlay"]
+            "--auto-add-overlay",
+            "--output-format", "zip"]
 
         for cf in compiled_files:
             link_args.extend(["-R", cf])
@@ -193,12 +196,23 @@ def build_apk(project_files, work_dir):
             log(f"[4/9] ✗ ОШИБКА: {r.stderr[:800]}")
             return {"success": False, "error": r.stderr[:800], "logs": logs}
 
-        # Проверяем что resources.ap_ создан и не пустой
+        # Проверяем что resources.ap_ создан, не пустой и валидный ZIP
         if not os.path.exists(resources_ap_) or os.path.getsize(resources_ap_) < 100:
             log(f"[4/9] ✗ resources.ap_ пустой или не создан ({os.path.getsize(resources_ap_) if os.path.exists(resources_ap_) else 'не существует'} bytes)")
             return {"success": False, "error": "resources.ap_ is empty or missing", "logs": logs}
 
-        log(f"[4/9] ✓ Ресурсы слинкованы, R.java создан (resources.ap_ = {os.path.getsize(resources_ap_)} bytes)")
+        # Проверяем что это валидный ZIP
+        try:
+            with zipfile.ZipFile(resources_ap_, "r") as test_zf:
+                entries = test_zf.namelist()
+                log(f"[4/9] ✓ Ресурсы слинкованы, R.java создан (resources.ap_ = {os.path.getsize(resources_ap_)} bytes, {len(entries)} entries: {', '.join(entries[:5])})")
+        except zipfile.BadZipFile:
+            log(f"[4/9] ✗ resources.ap_ — не валидный ZIP, пробую читать как бинарный...")
+            # Читаем первые 4 байта
+            with open(resources_ap_, "rb") as f:
+                header = f.read(4)
+            log(f"[4/9] Заголовок: {header.hex()}")
+            return {"success": False, "error": "resources.ap_ is not a valid ZIP", "logs": logs}
 
         log("[5/9] Компиляция Java (javac)...")
         classes_dir = os.path.join(work_dir, "classes")
