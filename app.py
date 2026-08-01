@@ -91,9 +91,11 @@ def build_apk(project_files, work_dir):
     <uses-sdk android:minSdkVersion="{min_sdk}" android:targetSdkVersion="34" />
     <application
         android:label="{app_name}"
-        android:theme="@android:style/Theme.NoTitleBar">
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+        android:allowBackup="false">
         <activity android:name=".{main_activity}"
-            android:exported="true">
+            android:exported="true"
+            android:configChanges="orientation|screenSize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
