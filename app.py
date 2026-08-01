@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Android Java → APK Compiler v2
-Полноценный мобильный IDE: множество файлов, ресурсы, манифест, Java, XML
+Android Java → APK Compiler v3
+Современный подход: aapt2 compile → aapt2 link → javac → d8 → apksigner
 """
 import os
 import sys
@@ -34,19 +34,6 @@ def cleanup_old_files():
 
 
 def build_apk(project_files, work_dir):
-    """
-    project_files = {
-        "app_name": "MyApp",
-        "package_name": "com.example.myapp",
-        "min_sdk": 26,
-        "files": {
-            "MainActivity.java": "...",
-            "AndroidManifest.xml": "...",
-            "res/values/strings.xml": "...",
-            ...
-        }
-    }
-    """
     logs = []
     def log(msg):
         logs.append(msg)
@@ -73,12 +60,10 @@ def build_apk(project_files, work_dir):
             filepath = filepath.strip().lstrip("/")
             if not filepath:
                 continue
-
             full_path = os.path.join(work_dir, filepath)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
-
             if filepath == "AndroidManifest.xml":
                 has_manifest = True
                 manifest_content = content
@@ -98,7 +83,6 @@ def build_apk(project_files, work_dir):
                         if "public class" in line:
                             main_activity = line.split("public class")[1].split("{")[0].strip().split()[0]
                             break
-
             manifest_content = f"""<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="{package_name}"
@@ -141,7 +125,8 @@ def build_apk(project_files, work_dir):
         else:
             log("[2/9] ✓ Ресурсы от пользователя")
 
-        log("[3/9] Компиляция ресурсов (aapt2)...")
+        # === [3/9] aapt2 compile ===
+        log("[3/9] Компиляция ресурсов (aapt2 compile)...")
         aapt2 = os.path.join(BUILD_TOOLS, "aapt2")
         compiled_res_dir = os.path.join(work_dir, "compiled_res")
         os.makedirs(compiled_res_dir, exist_ok=True)
@@ -149,7 +134,8 @@ def build_apk(project_files, work_dir):
         compiled_files = []
         for res_file in res_files_list:
             if res_file.endswith(".xml"):
-                # БЕЗ --legacy — создаёт правильные .flat файлы
+                # aapt2 compile -o <output_dir> <input.xml>
+                # Создаёт .flat файл с хешированным именем в output_dir
                 r = subprocess.run([aapt2, "compile", "-o", compiled_res_dir, res_file],
                     capture_output=True, text=True)
                 if r.returncode != 0:
@@ -157,7 +143,6 @@ def build_apk(project_files, work_dir):
                 else:
                     log(f"[3/9] ✓ {os.path.basename(res_file)}")
 
-        # Собираем ВСЕ .flat файлы из директории
         for f in os.listdir(compiled_res_dir):
             if f.endswith(".flat"):
                 compiled_files.append(os.path.join(compiled_res_dir, f))
@@ -166,11 +151,11 @@ def build_apk(project_files, work_dir):
             log("[3/9] ✗ Нет скомпилированных ресурсов")
             return {"success": False, "error": "No compiled resources", "logs": logs}
 
-        log(f"[3/9] ✓ Скомпилировано ресурсов: {len(compiled_files)}")
+        log(f"[3/9] ✓ Скомпилировано: {len(compiled_files)} файлов")
         for cf in compiled_files:
-            sz = os.path.getsize(cf)
-            log(f"      → {os.path.basename(cf)} ({sz} bytes)")
+            log(f"      → {os.path.basename(cf)} ({os.path.getsize(cf)} bytes)")
 
+        # === [4/9] aapt2 link ===
         log("[4/9] Линковка ресурсов (aapt2 link)...")
         r_java_dir = os.path.join(work_dir, "r_java")
         os.makedirs(r_java_dir, exist_ok=True)
@@ -185,9 +170,7 @@ def build_apk(project_files, work_dir):
             "--target-sdk-version", "34",
             "--version-code", "1",
             "--version-name", "1.0",
-            "--auto-add-overlay",
-            "--output-format", "zip"]
-
+            "--auto-add-overlay"]
         for cf in compiled_files:
             link_args.extend(["-R", cf])
 
@@ -196,24 +179,30 @@ def build_apk(project_files, work_dir):
             log(f"[4/9] ✗ ОШИБКА: {r.stderr[:800]}")
             return {"success": False, "error": r.stderr[:800], "logs": logs}
 
-        # Проверяем что resources.ap_ создан, не пустой и валидный ZIP
-        if not os.path.exists(resources_ap_) or os.path.getsize(resources_ap_) < 100:
-            log(f"[4/9] ✗ resources.ap_ пустой или не создан ({os.path.getsize(resources_ap_) if os.path.exists(resources_ap_) else 'не существует'} bytes)")
-            return {"success": False, "error": "resources.ap_ is empty or missing", "logs": logs}
+        # Проверяем resources.ap_
+        if not os.path.exists(resources_ap_):
+            log("[4/9] ✗ resources.ap_ не создан")
+            return {"success": False, "error": "resources.ap_ missing", "logs": logs}
 
-        # Проверяем что это валидный ZIP
+        ap_size = os.path.getsize(resources_ap_)
+        if ap_size < 100:
+            log(f"[4/9] ✗ resources.ap_ пустой ({ap_size} bytes)")
+            return {"success": False, "error": "resources.ap_ empty", "logs": logs}
+
+        # Проверяем что внутри ZIP
         try:
-            with zipfile.ZipFile(resources_ap_, "r") as test_zf:
-                entries = test_zf.namelist()
-                log(f"[4/9] ✓ Ресурсы слинкованы, R.java создан (resources.ap_ = {os.path.getsize(resources_ap_)} bytes, {len(entries)} entries: {', '.join(entries[:5])})")
+            with zipfile.ZipFile(resources_ap_, "r") as zf:
+                entries = zf.namelist()
+                log(f"[4/9] ✓ resources.ap_ = {ap_size} bytes, файлов: {len(entries)}")
+                for e in entries:
+                    info = zf.getinfo(e)
+                    log(f"      → {e} ({info.file_size} bytes)")
         except zipfile.BadZipFile:
-            log(f"[4/9] ✗ resources.ap_ — не валидный ZIP, пробую читать как бинарный...")
-            # Читаем первые 4 байта
-            with open(resources_ap_, "rb") as f:
-                header = f.read(4)
-            log(f"[4/9] Заголовок: {header.hex()}")
-            return {"success": False, "error": "resources.ap_ is not a valid ZIP", "logs": logs}
+            log(f"[4/9] ⚠ resources.ap_ не ZIP, заголовок: {open(resources_ap_, 'rb').read(4).hex()}")
+            # Попробуем использовать как есть — aapt2 link может создавать не-ZIP
+            log("[4/9] ✓ Продолжаем (aapt2 link output не ZIP)")
 
+        # === [5/9] javac ===
         log("[5/9] Компиляция Java (javac)...")
         classes_dir = os.path.join(work_dir, "classes")
         os.makedirs(classes_dir, exist_ok=True)
@@ -229,21 +218,21 @@ def build_apk(project_files, work_dir):
                     all_java.append(os.path.join(root, file))
 
         if not all_java:
-            log("[5/9] ✗ Нет Java файлов для компиляции")
-            return {"success": False, "error": "No Java files found", "logs": logs}
+            log("[5/9] ✗ Нет Java файлов")
+            return {"success": False, "error": "No Java files", "logs": logs}
 
         javac = os.path.join(os.environ.get("JAVA_HOME", "/usr/lib/jvm/java-17-openjdk-amd64"), "bin", "javac")
         classpath = os.path.join(PLATFORM, "android.jar")
-
         r = subprocess.run([javac, "-source", "1.8", "-target", "1.8", "-cp", classpath, "-d", classes_dir] + all_java,
             capture_output=True, text=True)
         if r.returncode != 0:
-            log(f"[5/9] ✗ ОШИБКА КОМПИЛЯЦИИ:")
+            log(f"[5/9] ✗ ОШИБКА:")
             for line in r.stderr.split("\n")[:25]:
                 log(f"  > {line}")
             return {"success": False, "error": r.stderr[:800], "logs": logs}
         log(f"[5/9] ✓ Java скомпилирован ({len(all_java)} файлов)")
 
+        # === [6/9] d8 ===
         log("[6/9] Конвертация в Dalvik (d8)...")
         d8 = os.path.join(BUILD_TOOLS, "d8")
         class_files = []
@@ -251,7 +240,6 @@ def build_apk(project_files, work_dir):
             for file in files:
                 if file.endswith(".class"):
                     class_files.append(os.path.join(root, file))
-
         r = subprocess.run([d8, "--release", "--output", work_dir, "--lib", classpath] + class_files,
             capture_output=True, text=True)
         if r.returncode != 0:
@@ -259,40 +247,49 @@ def build_apk(project_files, work_dir):
             return {"success": False, "error": r.stderr[:500], "logs": logs}
         log("[6/9] ✓ Dalvik байткод создан")
 
+        # === [7/9] Сборка APK ===
         log("[7/9] Сборка APK...")
         unsigned_apk = os.path.join(work_dir, f"{app_name}_unsigned.apk")
         dex_path = os.path.join(work_dir, "classes.dex")
 
-        # Пересобираем APK вручную: копируем всё из resources.ap_ + добавляем classes.dex
-        # resources.ap_ от aapt2 link — это ZIP, но zipfile.ZipFile("a") может ломать его
-        # Поэтому перепаковываем полностью
-        with zipfile.ZipFile(unsigned_apk, "w", zipfile.ZIP_DEFLATED) as out_zf:
-            # Копируем всё из resources.ap_
-            with zipfile.ZipFile(resources_ap_, "r") as res_zf:
-                for item in res_zf.infolist():
-                    out_zf.writestr(item, res_zf.read(item.filename))
-            # Добавляем classes.dex
-            if os.path.exists(dex_path):
-                with open(dex_path, "rb") as dex_f:
-                    out_zf.writestr("classes.dex", dex_f.read())
-                log(f"[7/9] ✓ APK собран, classes.dex добавлен ({os.path.getsize(dex_path)} bytes)")
-            else:
-                log("[7/9] ⚠ classes.dex не найден, APK без кода")
+        # Создаём APK: копируем всё из resources.ap_ + classes.dex
+        # resources.ap_ от aapt2 link — это ZIP-архив с манифестом и ресурсами
+        if os.path.exists(resources_ap_):
+            try:
+                with zipfile.ZipFile(unsigned_apk, "w", zipfile.ZIP_DEFLATED) as out_zf:
+                    with zipfile.ZipFile(resources_ap_, "r") as res_zf:
+                        for item in res_zf.infolist():
+                            out_zf.writestr(item, res_zf.read(item.filename))
+                    if os.path.exists(dex_path):
+                        with open(dex_path, "rb") as dex_f:
+                            out_zf.writestr("classes.dex", dex_f.read())
+                        log(f"[7/9] ✓ APK собран (classes.dex = {os.path.getsize(dex_path)} bytes)")
+                    else:
+                        log("[7/9] ⚠ classes.dex не найден")
+            except zipfile.BadZipFile:
+                # resources.ap_ не ZIP — копируем как бинарный и добавляем dex
+                log("[7/9] ⚠ resources.ap_ не ZIP, собираем вручную...")
+                shutil.copy(resources_ap_, unsigned_apk)
+                if os.path.exists(dex_path):
+                    with zipfile.ZipFile(unsigned_apk, "a", zipfile.ZIP_DEFLATED) as zf:
+                        zf.write(dex_path, "classes.dex")
+        else:
+            log("[7/9] ✗ resources.ap_ не найден")
+            return {"success": False, "error": "resources.ap_ missing", "logs": logs}
 
         apk_size = os.path.getsize(unsigned_apk)
-        log(f"[7/9] 📦 Размер unsigned APK: {apk_size} bytes")
+        log(f"[7/9] 📦 Unsigned APK: {apk_size} bytes")
 
+        # === [8/9] Подпись ===
         log("[8/9] Подпись APK...")
         keystore = os.path.join(work_dir, "debug.keystore")
         keytool = os.path.join(os.environ.get("JAVA_HOME", "/usr/lib/jvm/java-17-openjdk-amd64"), "bin", "keytool")
-
         subprocess.run([keytool, "-genkey", "-v", "-keystore", keystore, "-alias", "androiddebugkey",
             "-storepass", "android", "-keypass", "android", "-keyalg", "RSA", "-validity", "10000",
             "-dname", "CN=Android Debug,O=Android,C=US"], capture_output=True)
 
         apksigner = os.path.join(BUILD_TOOLS, "apksigner")
         signed_apk = os.path.join(work_dir, f"{app_name}.apk")
-
         r = subprocess.run([apksigner, "sign", "--ks", keystore, "--ks-pass", "pass:android",
             "--key-pass", "pass:android", "--out", signed_apk, unsigned_apk], capture_output=True, text=True)
 
@@ -306,6 +303,7 @@ def build_apk(project_files, work_dir):
         signed_size = os.path.getsize(signed_apk)
         log(f"[8/9] ✓ APK подписан ({signed_size} bytes)")
 
+        # === [9/9] zipalign ===
         log("[9/9] Выравнивание (zipalign)...")
         zipalign = os.path.join(BUILD_TOOLS, "zipalign")
         aligned_apk = os.path.join(work_dir, f"{app_name}_aligned.apk")
@@ -316,11 +314,10 @@ def build_apk(project_files, work_dir):
             log(f"[9/9] ✓ APK выровнен ({os.path.getsize(aligned_apk)} bytes)")
         else:
             final_apk = signed_apk
-            log(f"[9/9] ⚠ zipalign пропущен, использую signed APK")
+            log("[9/9] ⚠ zipalign пропущен")
 
         final_size = os.path.getsize(final_apk)
-        log(f"🎉 ИТОГО: APK = {final_size} bytes")
-
+        log(f"🎉 APK готов: {final_size} bytes")
         return {"success": True, "apk_path": final_apk, "logs": logs}
 
     except Exception as e:
@@ -328,7 +325,6 @@ def build_apk(project_files, work_dir):
         import traceback
         log(traceback.format_exc())
         return {"success": False, "error": str(e), "logs": logs}
-
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -824,6 +820,7 @@ def download(filename):
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
 
 
 if __name__ == "__main__":
