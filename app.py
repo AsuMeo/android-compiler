@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import subprocess
 from pathlib import Path
@@ -10,6 +11,83 @@ from telebot.types import InputFile
 
 app = Flask(__name__)
 CORS(app)
+
+# ── Find ffmpeg binary ─────────────────────────────────────────────────────
+FFMPEG_PATH = None
+
+def find_ffmpeg():
+    """Search for ffmpeg in PATH, common locations, or apt-get install it."""
+    global FFMPEG_PATH
+
+    # Check PATH
+    for cmd in ["ffmpeg", "ffmpeg.exe"]:
+        result = subprocess.run(["which", cmd], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            FFMPEG_PATH = result.stdout.strip()
+            return FFMPEG_PATH
+
+    # Check common locations
+    common_paths = [
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/opt/ffmpeg/bin/ffmpeg",
+        "/app/ffmpeg",
+        os.path.expanduser("~/.local/bin/ffmpeg"),
+    ]
+    for p in common_paths:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            FFMPEG_PATH = p
+            return p
+
+    # Try to install via apt if on Debian/Ubuntu (Render uses Ubuntu)
+    try:
+        install = subprocess.run(
+            ["apt-get", "update"],
+            capture_output=True, text=True, timeout=30
+        )
+        install = subprocess.run(
+            ["apt-get", "install", "-y", "ffmpeg"],
+            capture_output=True, text=True, timeout=120
+        )
+        if install.returncode == 0:
+            result = subprocess.run(["which", "ffmpeg"], capture_output=True, text=True)
+            if result.returncode == 0:
+                FFMPEG_PATH = result.stdout.strip()
+                return FFMPEG_PATH
+    except Exception:
+        pass
+
+    # Last resort: download static ffmpeg binary
+    try:
+        import urllib.request
+        ffmpeg_url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+        tmp_archive = "/tmp/ffmpeg.tar.xz"
+        urllib.request.urlretrieve(ffmpeg_url, tmp_archive)
+
+        subprocess.run(["tar", "-xf", tmp_archive, "-C", "/tmp"], check=True)
+
+        # Find extracted ffmpeg
+        for root, dirs, files in os.walk("/tmp"):
+            if "ffmpeg" in files:
+                candidate = os.path.join(root, "ffmpeg")
+                if os.access(candidate, os.X_OK):
+                    FFMPEG_PATH = candidate
+                    return candidate
+    except Exception:
+        pass
+
+    return None
+
+
+def get_ffmpeg():
+    """Return ffmpeg path, auto-find if not set."""
+    global FFMPEG_PATH
+    if FFMPEG_PATH is None or not os.path.isfile(FFMPEG_PATH):
+        FFMPEG_PATH = find_ffmpeg()
+    if FFMPEG_PATH is None:
+        raise RuntimeError("ffmpeg not found. Install it or set FFMPEG_PATH env var.")
+    return FFMPEG_PATH
+
 
 # ── HTML / CSS / JS (single file) ──────────────────────────────────────────
 HTML_PAGE = r"""
@@ -212,12 +290,17 @@ HTML_PAGE = r"""
 
 
 def run_cmd(cmd_list, label="cmd"):
-    """Run command list and log errors."""
+    """Run ffmpeg command and log errors."""
+    ffmpeg = get_ffmpeg()
+    # Replace "ffmpeg" at start with full path
+    if cmd_list[0] == "ffmpeg":
+        cmd_list[0] = ffmpeg
+
     result = subprocess.run(cmd_list, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"[{label}] FAILED")
-        print(f"[{label}] STDERR: {result.stderr[:800]}")
-        print(f"[{label}] STDOUT: {result.stdout[:800]}")
+        print(f"[{label}] CMD: {' '.join(cmd_list)}")
+        print(f"[{label}] STDERR: {result.stderr[:1000]}")
     return result.returncode == 0
 
 
@@ -234,7 +317,6 @@ def create_tg_overlay(width=800, height=800, duration=0.8, fps=30, out_path="/tm
         has_pil = False
 
     if has_pil:
-        # Paper plane polygon (normalized)
         plane_pts = [
             (0.18, 0.35), (0.50, 0.48), (0.82, 0.50),
             (0.50, 0.58), (0.35, 0.82), (0.42, 0.62), (0.18, 0.35)
@@ -245,7 +327,6 @@ def create_tg_overlay(width=800, height=800, duration=0.8, fps=30, out_path="/tm
             bg = Image.new('RGB', (width, height), '#120812')
             draw = ImageDraw.Draw(bg)
 
-            # Vignette
             cx, cy = width // 2, height // 2
             max_r = int((width**2 + height**2) ** 0.5 / 2)
             for r in range(max_r, 0, -8):
@@ -285,8 +366,9 @@ def create_tg_overlay(width=800, height=800, duration=0.8, fps=30, out_path="/tm
 
             bg.save(f"{frame_dir}/frame_{i:04d}.png")
 
+        ffmpeg = get_ffmpeg()
         cmd = [
-            "ffmpeg", "-y", "-framerate", str(fps),
+            ffmpeg, "-y", "-framerate", str(fps),
             "-i", f"{frame_dir}/frame_%04d.png",
             "-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-an", "-pix_fmt", "yuv420p", "-t", str(duration), out_path
@@ -300,9 +382,9 @@ def create_tg_overlay(width=800, height=800, duration=0.8, fps=30, out_path="/tm
         return ok, out_path
 
     else:
-        # Fallback ffmpeg drawtext
+        ffmpeg = get_ffmpeg()
         cmd = [
-            "ffmpeg", "-y", "-f", "lavfi",
+            ffmpeg, "-y", "-f", "lavfi",
             "-i", f"color=c=#120812:s={width}x{height}:r={fps}",
             "-vf",
             f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='TELEGRAM':x=w-tw-35:y=h-th-30:fontcolor=white@0.35:fontsize=18:enable='between(t,0,{duration})',drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='\\u27A4':x=35:y=h-70:fontcolor=white@0.85:fontsize=45:enable='between(t,0,{duration})'",
@@ -316,12 +398,10 @@ def create_tg_overlay(width=800, height=800, duration=0.8, fps=30, out_path="/tm
 def process_video_with_overlay(input_path: str, output_path: str) -> bool:
     """Full pipeline: overlay intro + square crop + concat + circular mask."""
 
-    # Step 1: Overlay intro
     overlay_ok, overlay_path = create_tg_overlay()
     if not overlay_ok:
         return False
 
-    # Step 2: Square crop main video
     main_sq = "/tmp/main_square.mp4"
     cmd_sq = [
         "ffmpeg", "-y", "-i", input_path,
@@ -332,7 +412,6 @@ def process_video_with_overlay(input_path: str, output_path: str) -> bool:
     if not run_cmd(cmd_sq, "square_crop"):
         return False
 
-    # Step 3: Concatenate
     concat_list = "/tmp/concat_list.txt"
     with open(concat_list, "w") as f:
         f.write(f"file '{overlay_path}'\n")
@@ -346,7 +425,6 @@ def process_video_with_overlay(input_path: str, output_path: str) -> bool:
     if not run_cmd(cmd_concat, "concat"):
         return False
 
-    # Step 4: Circular mask PNG
     mask_path = "/tmp/circle_mask_800.png"
     cmd_mask = [
         "ffmpeg", "-y", "-f", "lavfi",
@@ -357,7 +435,6 @@ def process_video_with_overlay(input_path: str, output_path: str) -> bool:
     if not run_cmd(cmd_mask, "mask"):
         return False
 
-    # Step 5: Apply mask
     cmd_final = [
         "ffmpeg", "-y", "-i", concat_out, "-i", mask_path,
         "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto[masked];[masked]format=yuv420p",
@@ -366,7 +443,6 @@ def process_video_with_overlay(input_path: str, output_path: str) -> bool:
     ]
     ok = run_cmd(cmd_final, "final")
 
-    # Cleanup
     for f in [overlay_path, main_sq, concat_list, concat_out, mask_path]:
         try:
             os.unlink(f)
