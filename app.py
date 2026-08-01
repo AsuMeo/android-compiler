@@ -1,261 +1,362 @@
-import os
-import tempfile
-import subprocess
-import traceback
-from pathlib import Path
+# ═══════════════════════════════════════════
+#  МОЙ ИИ ЧАТ-БОТ — НЕЙРОСЕТЬ С НУЛЯ
+#  Требует: pip install flask numpy
+#  Запуск: python app.py
+# ═══════════════════════════════════════════
 
+import json
+import os
+import numpy as np
 from flask import Flask, render_template_string, request, jsonify
-from flask_cors import CORS
-from telebot import TeleBot
-from telebot.types import InputFile
 
 app = Flask(__name__)
-CORS(app)
 
-FFMPEG_LOGS = []
+# ═══════════════════════════════════════════
+#  ТОКЕНИЗАТОР (Буквы → Числа)
+# ═══════════════════════════════════════════
+class Tokenizer:
+    def __init__(self):
+        self.char_to_idx = {}
+        self.idx_to_char = {}
+        self.vocab_size = 0
 
-def ff(*args):
-    for p in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "ffmpeg"]:
-        r = subprocess.run(["which", p], capture_output=True, text=True, timeout=3)
-        if r.returncode == 0 and r.stdout.strip():
-            return [r.stdout.strip()] + list(args)
-    return ["ffmpeg"] + list(args)
+    def fit(self, text):
+        chars = sorted(list(set(text)))
+        self.char_to_idx = {ch: i for i, ch in enumerate(chars)}
+        self.idx_to_char = {i: ch for ch, i in self.char_to_idx.items()}
+        self.vocab_size = len(chars)
+        return self
+
+    def encode(self, text):
+        return [self.char_to_idx[ch] for ch in text if ch in self.char_to_idx]
+
+    def decode(self, indices):
+        return ''.join([self.idx_to_char[i] for i in indices])
+
+    def to_json(self):
+        return {
+            'char_to_idx': self.char_to_idx,
+            'idx_to_char': {str(k): v for k, v in self.idx_to_char.items()},
+            'vocab_size': self.vocab_size
+        }
+
+    @classmethod
+    def from_json(cls, data):
+        t = cls()
+        t.char_to_idx = data['char_to_idx']
+        t.idx_to_char = {int(k): v for k, v in data['idx_to_char'].items()}
+        t.vocab_size = data['vocab_size']
+        return t
 
 
-def run_cmd(cmd_list, label="cmd"):
-    global FFMPEG_LOGS
-    result = subprocess.run(cmd_list, capture_output=True, text=True, timeout=120)
-    log_entry = {
-        "label": label,
-        "cmd": " ".join(cmd_list),
-        "returncode": result.returncode,
-        "stdout": result.stdout[-2000:] if result.stdout else "",
-        "stderr": result.stderr[-2000:] if result.stderr else "",
+# ═══════════════════════════════════════════
+#  RNN НЕЙРОСЕТЬ С НУЛЯ
+# ═══════════════════════════════════════════
+class RNN:
+    def __init__(self, vocab_size, hidden_size=128):
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.W_ih = np.random.randn(hidden_size, vocab_size) * 0.01
+        self.W_hh = np.random.randn(hidden_size, hidden_size) * 0.01
+        self.W_hy = np.random.randn(vocab_size, hidden_size) * 0.01
+        self.b_h = np.zeros((hidden_size, 1))
+        self.b_y = np.zeros((vocab_size, 1))
+        self.cache = {}
+
+    def _softmax(self, x):
+        e_x = np.exp(x - np.max(x))
+        return e_x / np.sum(e_x)
+
+    def forward(self, inputs, h_prev=None):
+        if h_prev is None:
+            h_prev = np.zeros((self.hidden_size, 1))
+        xs, hs, ys, ps = {}, {}, {}, {}
+        hs[-1] = np.copy(h_prev)
+        loss = 0
+        for t in range(len(inputs)):
+            xs[t] = np.zeros((self.vocab_size, 1))
+            xs[t][inputs[t]] = 1
+            hs[t] = np.tanh(self.W_ih @ xs[t] + self.W_hh @ hs[t-1] + self.b_h)
+            ys[t] = self.W_hy @ hs[t] + self.b_y
+            ps[t] = self._softmax(ys[t])
+            if t < len(inputs) - 1:
+                loss += -np.log(ps[t][inputs[t+1], 0] + 1e-8)
+        self.cache = {'xs': xs, 'hs': hs, 'ys': ys, 'ps': ps}
+        return loss, hs[len(inputs)-1]
+
+    def backward(self, inputs):
+        xs, hs, ps = self.cache['xs'], self.cache['hs'], self.cache['ps']
+        dW_ih = np.zeros_like(self.W_ih)
+        dW_hh = np.zeros_like(self.W_hh)
+        dW_hy = np.zeros_like(self.W_hy)
+        db_h = np.zeros_like(self.b_h)
+        db_y = np.zeros_like(self.b_y)
+        dh_next = np.zeros_like(hs[0])
+        for t in reversed(range(len(inputs))):
+            dy = np.copy(ps[t])
+            if t < len(inputs) - 1:
+                dy[inputs[t+1]] -= 1
+            dW_hy += dy @ hs[t].T
+            db_y += dy
+            dh = self.W_hy.T @ dy + dh_next
+            dh_raw = (1 - hs[t] ** 2) * dh
+            dW_ih += dh_raw @ xs[t].T
+            dW_hh += dh_raw @ hs[t-1].T
+            db_h += dh_raw
+            dh_next = self.W_hh.T @ dh_raw
+        for d in [dW_ih, dW_hh, dW_hy, db_h, db_y]:
+            np.clip(d, -5, 5, out=d)
+        return dW_ih, dW_hh, dW_hy, db_h, db_y
+
+    def update(self, dW_ih, dW_hh, dW_hy, db_h, db_y, lr):
+        self.W_ih -= lr * dW_ih
+        self.W_hh -= lr * dW_hh
+        self.W_hy -= lr * dW_hy
+        self.b_h -= lr * db_h
+        self.b_y -= lr * db_y
+
+    def sample(self, tokenizer, seed_text, n=200, temperature=1.0):
+        h = np.zeros((self.hidden_size, 1))
+        for ch in seed_text:
+            x = np.zeros((self.vocab_size, 1))
+            x[tokenizer.char_to_idx[ch]] = 1
+            h = np.tanh(self.W_ih @ x + self.W_hh @ h + self.b_h)
+        result = seed_text
+        ix = tokenizer.char_to_idx[seed_text[-1]]
+        for _ in range(n):
+            x = np.zeros((self.vocab_size, 1))
+            x[ix] = 1
+            h = np.tanh(self.W_ih @ x + self.W_hh @ h + self.b_h)
+            y = self.W_hy @ h + self.b_y
+            y = y / temperature
+            p = self._softmax(y).ravel()
+            ix = np.random.choice(range(self.vocab_size), p=p)
+            result += tokenizer.idx_to_char[ix]
+        return result
+
+    def to_json(self):
+        return {
+            'W_ih': self.W_ih.tolist(),
+            'W_hh': self.W_hh.tolist(),
+            'W_hy': self.W_hy.tolist(),
+            'b_h': self.b_h.tolist(),
+            'b_y': self.b_y.tolist(),
+            'hidden_size': self.hidden_size,
+            'vocab_size': self.vocab_size
+        }
+
+    @classmethod
+    def from_json(cls, data):
+        rnn = cls(data['vocab_size'], data['hidden_size'])
+        rnn.W_ih = np.array(data['W_ih'])
+        rnn.W_hh = np.array(data['W_hh'])
+        rnn.W_hy = np.array(data['W_hy'])
+        rnn.b_h = np.array(data['b_h'])
+        rnn.b_y = np.array(data['b_y'])
+        return rnn
+
+
+# ═══════════════════════════════════════════
+#  ОБУЧЕНИЕ + ЗАГРУЗКА МОДЕЛИ
+# ═══════════════════════════════════════════
+MODEL_PATH = 'model_weights.json'
+
+TRAIN_DATA = """Привет! Как дела?
+Отлично, спасибо! А у тебя?
+У меня тоже всё хорошо.
+Чем занимаешься?
+Программирую нейросеть с нуля.
+Круто! Без трансформеров?
+Да, чистая математика на NumPy.
+Это впечатляет. Какой размер скрытого слоя?
+Сейчас 128, но можно и больше.
+А какой loss?
+CrossEntropy, классика.
+Понятно. А backpropagation сам пишешь?
+Конечно, градиенты вручную.
+Молодец. Когда запускаешь?
+Скоро на Render.
+Отличный выбор для хостинга.
+Спасибо! Надеюсь всё заработает.
+Обязательно заработает. Удачи!
+Спасибо, пока!
+Пока, увидимся!"""
+
+def train_model():
+    tokenizer = Tokenizer().fit(TRAIN_DATA)
+    rnn = RNN(tokenizer.vocab_size, hidden_size=128)
+    SEQ_LENGTH = 20
+    LR = 0.01
+    EPOCHS = 5000
+    smooth_loss = -np.log(1.0 / tokenizer.vocab_size) * SEQ_LENGTH
+    p = 0
+    text = TRAIN_DATA
+    for epoch in range(EPOCHS):
+        if p + SEQ_LENGTH + 1 >= len(text):
+            hprev = np.zeros((128, 1))
+            p = 0
+        inputs = tokenizer.encode(text[p:p + SEQ_LENGTH])
+        if len(inputs) < SEQ_LENGTH:
+            p = 0
+            continue
+        loss, hprev = rnn.forward(inputs, hprev)
+        grads = rnn.backward(inputs)
+        rnn.update(*grads, LR)
+        smooth_loss = smooth_loss * 0.999 + loss * 0.001
+        if epoch % 1000 == 0:
+            print(f"Epoch {epoch}, Loss: {smooth_loss:.4f}")
+        p += SEQ_LENGTH
+    model_data = {
+        'tokenizer': tokenizer.to_json(),
+        'rnn': rnn.to_json()
     }
-    FFMPEG_LOGS.append(log_entry)
-    return result.returncode == 0, log_entry
+    with open(MODEL_PATH, 'w', encoding='utf-8') as f:
+        json.dump(model_data, f)
+    print("✅ Модель обучена и сохранена!")
+    return tokenizer, rnn
+
+if not os.path.exists(MODEL_PATH):
+    print("🚀 Начинаю обучение...")
+    tokenizer, rnn = train_model()
+else:
+    print("📦 Загружаю модель...")
+    with open(MODEL_PATH, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    tokenizer = Tokenizer.from_json(data['tokenizer'])
+    rnn = RNN.from_json(data['rnn'])
+    print("✅ Модель загружена!")
 
 
-HTML_PAGE = r"""
+# ═══════════════════════════════════════════
+#  HTML + CSS + JS
+# ═══════════════════════════════════════════
+HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VideoNote Sender</title>
+<title>🧠 Мой ИИ Чат-Бот</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{font-family:'Inter',sans-serif;background:#0a0a0f;color:#e0e0e5;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-  .container{width:100%;max-width:460px;background:#111118;border:1px solid #1e1e2e;border-radius:20px;padding:28px;box-shadow:0 8px 40px rgba(0,0,0,.5)}
-  h1{font-size:20px;font-weight:700;color:#fff;margin-bottom:4px;display:flex;align-items:center;gap:10px}
-  h1 svg{width:26px;height:26px;fill:#2aabee}
-  .subtitle{font-size:12px;color:#6b6b7b;margin-bottom:20px}
-  .field{margin-bottom:14px}
-  label{display:block;font-size:11px;font-weight:500;color:#8a8a9a;margin-bottom:5px;text-transform:uppercase;letter-spacing:.5px}
-  input[type="text"],input[type="file"]{width:100%;background:#0d0d14;border:1px solid #222233;border-radius:10px;padding:10px 12px;color:#e0e0e5;font-size:13px;font-family:inherit;outline:none}
-  input:focus{border-color:#2aabee;box-shadow:0 0 0 2px rgba(42,171,238,.1)}
-  input[type="file"]{padding:8px 12px;cursor:pointer}
-  input[type="file"]::-webkit-file-upload-button{background:#1a1a2a;border:1px solid #2a2a3a;border-radius:6px;color:#8a8a9a;padding:5px 10px;margin-right:8px;cursor:pointer;font-size:11px}
-  .preview-wrap{width:100%;aspect-ratio:1/1;background:#0d0d14;border:1px dashed #2a2a3a;border-radius:50%;display:flex;align-items:center;justify-content:center;margin-bottom:14px;overflow:hidden}
-  .preview-wrap video{width:100%;height:100%;object-fit:cover;border-radius:50%}
-  .preview-wrap .placeholder{text-align:center;color:#4a4a5a;font-size:12px}
-  .preview-wrap .placeholder svg{width:36px;height:36px;fill:#2a2a3a;margin-bottom:6px;display:block;margin:0 auto}
-  .btn{width:100%;background:#2aabee;border:none;border-radius:10px;padding:12px;color:#fff;font-size:14px;font-weight:600;font-family:inherit;cursor:pointer}
-  .btn:hover{background:#1d9ad8}
-  .btn:disabled{background:#1a3a4a;cursor:not-allowed}
-  .progress-wrap{margin-top:12px;display:none}
-  .progress-bar{height:5px;background:#1a1a2a;border-radius:3px;overflow:hidden}
-  .progress-fill{height:100%;width:0%;background:#2aabee;border-radius:3px;transition:width .3s}
-  .progress-text{text-align:center;font-size:11px;color:#8a8a9a;margin-top:5px}
-  .status{margin-top:12px;padding:10px 12px;border-radius:8px;font-size:12px;display:none}
-  .status.ok{background:#0f2e1f;border:1px solid #1a4a2f;color:#4ade80}
-  .status.err{background:#2e0f0f;border:1px solid #4a1a1a;color:#f87171}
-  .logs-box{margin-top:12px;background:#0a0a12;border:1px solid #1e1e2e;border-radius:8px;padding:10px;font-size:10px;color:#888;font-family:monospace;max-height:300px;overflow-y:auto;display:none;white-space:pre-wrap;word-break:break-all}
-  .logs-box.show{display:block}
-  .logs-title{font-size:10px;color:#555;margin-bottom:4px;text-transform:uppercase}
-  .footer{margin-top:14px;text-align:center;font-size:10px;color:#3a3a4a}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}
+.container{max-width:800px;width:100%}
+h1{color:#00d4ff;text-align:center;font-size:2.8rem;margin-bottom:8px;text-shadow:0 0 20px rgba(0,212,255,0.3)}
+.subtitle{text-align:center;color:#6b7280;margin-bottom:30px;font-size:1rem}
+.chat-box{background:#111118;border:1px solid #1f1f2e;border-radius:16px;padding:20px;min-height:400px;max-height:500px;overflow-y:auto;margin-bottom:20px;box-shadow:0 0 30px rgba(0,212,255,0.05)}
+.message{margin-bottom:16px;padding:14px 18px;border-radius:14px;max-width:85%;word-wrap:break-word;line-height:1.5;animation:fadeIn 0.3s ease}
+.user{background:linear-gradient(135deg,#1a3a4a,#0d2a3a);margin-left:auto;border-bottom-right-radius:4px;color:#7dd3fc}
+.bot{background:linear-gradient(135deg,#1a1a2e,#111118);margin-right:auto;border-bottom-left-radius:4px;color:#a5b4fc;border:1px solid #1f1f3a}
+.typing{color:#6b7280;font-style:italic}
+.input-area{display:flex;gap:12px}
+input{flex:1;padding:14px 18px;border-radius:12px;border:1px solid #1f1f2e;background:#111118;color:#e0e0e0;font-size:1rem;outline:none;transition:0.2s}
+input:focus{border-color:#00d4ff;box-shadow:0 0 10px rgba(0,212,255,0.1)}
+button{padding:14px 28px;border-radius:12px;border:none;background:linear-gradient(135deg,#00d4ff,#0099cc);color:#0a0a0f;font-weight:bold;font-size:1rem;cursor:pointer;transition:0.2s}
+button:hover{transform:translateY(-2px);box-shadow:0 5px 20px rgba(0,212,255,0.3)}
+button:disabled{opacity:0.5;cursor:not-allowed;transform:none}
+.info{margin-top:20px;text-align:center;color:#4b5563;font-size:0.85rem}
+.info span{color:#00d4ff}
+@keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#1f1f2e;border-radius:3px}
 </style>
 </head>
 <body>
 <div class="container">
-  <h1><svg viewBox="0 0 24 24"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg>VideoNote Sender</h1>
-  <p class="subtitle">Отправка кружочков с нативной обводкой Telegram</p>
-  <form id="uploadForm" enctype="multipart/form-data">
-    <div class="field"><label>Bot Token</label><input type="text" name="token" id="token" placeholder="123456:ABC-DEF..." required></div>
-    <div class="field"><label>Chat ID</label><input type="text" name="chat_id" id="chat_id" placeholder="-1001234567890" required></div>
-    <div class="field"><label>Видео</label><input type="file" name="video" id="video" accept="video/*" required></div>
-    <div class="preview-wrap" id="previewWrap"><div class="placeholder"><svg viewBox="0 0 24 24"><path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4zM14 13h-3v3H9v-3H6v-2h3V8h2v3h3v2z"/></svg>Выберите видео</div></div>
-    <button type="submit" class="btn" id="submitBtn">Отправить кружок</button>
-  </form>
-  <div class="progress-wrap" id="progressWrap"><div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div><div class="progress-text" id="progressText">0%</div></div>
-  <div class="status" id="status"></div>
-  <div class="logs-box" id="logsBox"><div class="logs-title">Логи FFmpeg</div><div id="logsContent"></div></div>
-  <div class="footer">Render-ready &middot; Docker</div>
+<h1>🧠 Мой ИИ Чат-Бот</h1>
+<p class="subtitle">Нейросеть с нуля • RNN • NumPy • Без Transformers</p>
+<div class="chat-box" id="chatBox">
+<div class="message bot">Привет! Я нейросеть, обученная с нуля на чистой математике. Напиши что-нибудь!</div>
+</div>
+<div class="input-area">
+<input type="text" id="userInput" placeholder="Напиши сообщение..." maxlength="100" autocomplete="off">
+<button id="sendBtn" onclick="sendMessage()">Отправить</button>
+</div>
+<div class="info">
+<span>Архитектура:</span> Vanilla RNN | <span>Скрытый слой:</span> 128 | <span>Токенизатор:</span> Char-level | <span>Обучение:</span> Backprop + CrossEntropy
+</div>
 </div>
 <script>
-  const videoInput=document.getElementById('video');
-  const previewWrap=document.getElementById('previewWrap');
-  const form=document.getElementById('uploadForm');
-  const statusDiv=document.getElementById('status');
-  const submitBtn=document.getElementById('submitBtn');
-  const progressWrap=document.getElementById('progressWrap');
-  const progressFill=document.getElementById('progressFill');
-  const progressText=document.getElementById('progressText');
-  const logsBox=document.getElementById('logsBox');
-  const logsContent=document.getElementById('logsContent');
-  function setProgress(pct,text){progressFill.style.width=pct+'%';progressText.textContent=text||(pct+'%');progressWrap.style.display='block'}
-  function showLogs(html){logsContent.innerHTML=html;logsBox.classList.add('show')}
-  videoInput.addEventListener('change',function(){const file=this.files[0];if(!file)return;previewWrap.innerHTML=`<video src="${URL.createObjectURL(file)}" autoplay loop muted playsinline></video>`});
-  form.addEventListener('submit',async function(e){e.preventDefault();statusDiv.style.display='none';logsBox.classList.remove('show');submitBtn.disabled=true;submitBtn.textContent='Обработка...';setProgress(10,'Загрузка видео...');try{const res=await fetch('/send',{method:'POST',body:new FormData(form)});setProgress(80,'Обработка ответа...');const data=await res.json();setProgress(100,'Готово!');statusDiv.style.display='block';if(data.ok){statusDiv.className='status ok';statusDiv.textContent='✅ '+data.message}else{statusDiv.className='status err';statusDiv.textContent='❌ '+data.message}if(data.logs){let html='';data.logs.forEach((log,i)=>{html+=`<div style="margin-bottom:8px;border-bottom:1px solid #1a1a2a;padding-bottom:4px;"><span style="color:#2aabee">[${log.label}]</span> rc=${log.returncode}<br><span style="color:#555">CMD:</span> ${log.cmd}<br>`;if(log.stderr)html+=`<span style="color:#f87171">ERR:</span> ${log.stderr}<br>`;if(log.stdout)html+=`<span style="color:#4ade80">OUT:</span> ${log.stdout}<br>`;html+=`</div>`});showLogs(html)}}catch(err){statusDiv.style.display='block';statusDiv.className='status err';statusDiv.textContent='❌ Сеть: '+err.message}finally{submitBtn.disabled=false;submitBtn.textContent='Отправить кружок';setTimeout(()=>{progressWrap.style.display='none'},3000)}});
+const chatBox = document.getElementById('chatBox');
+const userInput = document.getElementById('userInput');
+const sendBtn = document.getElementById('sendBtn');
+userInput.addEventListener('keypress', (e) => { if(e.key === 'Enter') sendMessage(); });
+function addMessage(text, isUser) {
+    const div = document.createElement('div');
+    div.className = 'message ' + (isUser ? 'user' : 'bot');
+    div.textContent = text;
+    chatBox.appendChild(div);
+    chatBox.scrollTop = chatBox.scrollHeight;
+}
+function addTyping() {
+    const div = document.createElement('div');
+    div.className = 'message bot typing';
+    div.id = 'typing';
+    div.textContent = 'Думаю...';
+    chatBox.appendChild(div);
+    chatBox.scrollTop = chatBox.scrollHeight;
+}
+function removeTyping() {
+    const t = document.getElementById('typing');
+    if(t) t.remove();
+}
+async function sendMessage() {
+    const text = userInput.value.trim();
+    if(!text) return;
+    addMessage(text, true);
+    userInput.value = '';
+    sendBtn.disabled = true;
+    addTyping();
+    try {
+        const res = await fetch('/chat', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({message: text})
+        });
+        const data = await res.json();
+        removeTyping();
+        addMessage(data.reply, false);
+    } catch(e) {
+        removeTyping();
+        addMessage('Ошибка соединения...', false);
+    }
+    sendBtn.disabled = false;
+    userInput.focus();
+}
 </script>
 </body>
 </html>
 """
 
 
-def make_overlay(out_path="/tmp/tg_overlay.mp4", w=800, h=800, dur=0.8, fps=30):
-    frames = int(dur * fps)
-    frame_dir = "/tmp/tg_frames"
-    os.makedirs(frame_dir, exist_ok=True)
-
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-        plane_pts = [(0.18,0.35),(0.50,0.48),(0.82,0.50),(0.50,0.58),(0.35,0.82),(0.42,0.62),(0.18,0.35)]
-        for i in range(frames):
-            t = i / max(frames-1, 1)
-            bg = Image.new('RGB', (w,h), '#120812')
-            draw = ImageDraw.Draw(bg)
-            cx, cy = w//2, h//2
-            max_r = int((w*w+h*h)**0.5/2)
-            for r in range(max_r, 0, -8):
-                v = int(18 * r / max_r)
-                draw.ellipse([cx-r,cy-r,cx+r,cy+r], outline=f'#{v:02x}{v//4:02x}{v//4:02x}')
-            fade = min(1.0, t*2.5)
-            ls = 52
-            blx, bly = 32, h-32-ls
-            pulse = 1.0 + 0.06*(1.0-abs(t-0.5)*2)*fade
-            s = ls * pulse
-            lx, ly = blx-(s-ls)/2, bly-(s-ls)/2
-            pts = [(lx+p[0]*s, ly+p[1]*s) for p in plane_pts]
-            draw.polygon(pts, fill=(255,255,255))
-            try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 19)
-            except:
-                try:
-                    font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 19)
-                except:
-                    font = ImageFont.load_default()
-            text = "TELEGRAM"
-            bbox = draw.textbbox((0,0), text, font=font)
-            tw = bbox[2]-bbox[0]
-            tx, ty = w-tw-35, h-35
-            for j,ch in enumerate(text):
-                draw.text((tx+j*11, ty), ch, fill=(255,255,255), font=font)
-            bg.save(f"{frame_dir}/frame_{i:04d}.png")
-
-        ok, _ = run_cmd(ff("-y","-framerate",str(fps),"-i",f"{frame_dir}/frame_%04d.png",
-            "-c:v","libx264","-preset","fast","-crf","18","-an","-pix_fmt","yuv420p","-t",str(dur),out_path), "overlay")
-        for f in os.listdir(frame_dir):
-            os.unlink(os.path.join(frame_dir,f))
-        os.rmdir(frame_dir)
-        return ok, out_path
-    except Exception as e:
-        FFMPEG_LOGS.append({"label":"overlay_exc","cmd":"PIL","returncode":-1,"stderr":str(e),"stdout":""})
-        return False, out_path
-
-
-def process_video(input_path, output_path):
-    global FFMPEG_LOGS
-    FFMPEG_LOGS = []
-
-    ok, _ = make_overlay()
-    if not ok:
-        return False
-    overlay = "/tmp/tg_overlay.mp4"
-
-    main_sq = "/tmp/main_sq.mp4"
-    # FIX: use filter_script or simpler filter to avoid comma escaping hell
-    filter_str = "crop='min(iw,ih)':'min(iw,ih)',scale=800:800:force_original_aspect_ratio=increase,crop=800:800,setsar=1,format=yuv420p"
-    ok, _ = run_cmd(ff("-y","-i",input_path,"-vf",filter_str,
-        "-c:v","libx264","-preset","fast","-crf","23","-an","-movflags","+faststart",main_sq), "square")
-    if not ok:
-        return False
-
-    clist = "/tmp/concat.txt"
-    with open(clist,"w") as f:
-        f.write(f"file '{overlay}'\nfile '{main_sq}'\n")
-
-    concat = "/tmp/concat.mp4"
-    ok, _ = run_cmd(ff("-y","-f","concat","-safe","0","-i",clist,"-c","copy",concat), "concat")
-    if not ok:
-        return False
-
-    mask = "/tmp/mask.png"
-    mask_filter = "format=rgba,geq=lum=0:a='if(lt(hypot(X-400,Y-400),390),255,if(lt(hypot(X-400,Y-400),400),lerp(0,255,(400-hypot(X-400,Y-400))/10),0))',format=rgba"
-    ok, _ = run_cmd(ff("-y","-f","lavfi","-i","color=black:s=800x800","-vf",mask_filter,
-        "-frames:v","1",mask), "mask")
-    if not ok:
-        return False
-
-    ok, _ = run_cmd(ff("-y","-i",concat,"-i",mask,"-filter_complex",
-        "[0:v][1:v]overlay=0:0:format=auto[masked];[masked]format=yuv420p",
-        "-c:v","libx264","-preset","fast","-crf","23","-an","-movflags","+faststart",output_path), "final")
-
-    for f in [overlay, main_sq, clist, concat, mask]:
-        try:
-            os.unlink(f)
-        except:
-            pass
-    return ok
-
-
-@app.route("/")
+# ═══════════════════════════════════════════
+#  FLASK ROUTES
+# ═══════════════════════════════════════════
+@app.route('/')
 def index():
     return render_template_string(HTML_PAGE)
 
-
-@app.route("/send", methods=["POST"])
-def send():
-    global FFMPEG_LOGS
-    token = request.form.get("token","").strip()
-    chat_id = request.form.get("chat_id","").strip()
-    video_file = request.files.get("video")
-
-    if not token or not chat_id or not video_file:
-        return jsonify({"ok":False,"message":"Заполните все поля","logs":[]})
-
-    suffix = Path(video_file.filename).suffix or ".mp4"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_in:
-        video_file.save(tmp_in)
-        tmp_in_path = tmp_in.name
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_out:
-        tmp_out_path = tmp_out.name
-
-    try:
-        ok = process_video(tmp_in_path, tmp_out_path)
-        if not ok:
-            logs = [{k:v for k,v in log.items()} for log in FFMPEG_LOGS]
-            return jsonify({"ok":False,"message":"Ошибка FFmpeg — смотри логи ниже","logs":logs})
-
-        bot = TeleBot(token)
-        with open(tmp_out_path, "rb") as f:
-            bot.send_video_note(chat_id=chat_id, video_note=InputFile(f), duration=None, length=800)
-        return jsonify({"ok":True,"message":"Кружок отправлен!","logs":[]})
-
-    except Exception as e:
-        tb = traceback.format_exc()
-        return jsonify({"ok":False,"message":str(e),"logs":[{"label":"python_exc","cmd":"","returncode":-1,"stderr":tb,"stdout":""}]})
-
-    finally:
-        for p in (tmp_in_path, tmp_out_path):
-            try:
-                os.unlink(p)
-            except:
-                pass
+@app.route('/chat', methods=['POST'])
+def chat():
+    data = request.get_json()
+    user_msg = data.get('message', '')
+    if not user_msg:
+        return jsonify({'reply': 'Напиши что-нибудь!'})
+    seed = user_msg[-20:] if len(user_msg) > 20 else user_msg
+    seed = seed + ' ' if not seed.endswith(' ') else seed
+    reply = rnn.sample(tokenizer, seed, n=80, temperature=0.7)
+    reply = reply[len(seed):].strip()
+    for end_char in ['.', '!', '?', '\n']:
+        idx = reply.find(end_char)
+        if idx > 10:
+            reply = reply[:idx+1]
+            break
+    if not reply:
+        reply = "Интересно! Расскажи подробнее."
+    return jsonify({'reply': reply})
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
